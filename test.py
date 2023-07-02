@@ -5,51 +5,30 @@ from torch_geometric.data import Data
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-#import graphviz
 import torch_geometric.transforms as T
 from torch_geometric.datasets import ExplainerDataset
 from torch_geometric.datasets.graph_generator import BAGraph
-from torch_geometric.explain import Explainer,GNNExplainer
+from torch_geometric.explain import Explainer, GNNExplainer
 from torch_geometric.nn import GCN
 from torch_geometric.utils import k_hop_subgraph
-#from torch_geometric.explain.metric import fidelity, groundtruth_metrics
 import networkx as nx
 import matplotlib.pyplot as plt
 from torch_geometric.utils import to_networkx
 
-# dataset = CoraFull(root='.', name="Pubmed")
 
+def train_model(model, data, train_idx, optimizer):
+    """
+    Train the GCN model.
 
+    Args:
+        model (GCN): The GCN model to be trained.
+        data (Data): The input data.
+        train_idx (torch.Tensor): Indices of nodes in the training set.
+        optimizer (torch.optim.Optimizer): The optimizer for training.
 
-
-
-
-
-dataset = ExplainerDataset(
-    graph_generator=BAGraph(num_nodes=300, num_edges=5),
-    motif_generator='house',
-    num_motifs=80,
-    transform=T.Constant(),
-)
-data = dataset[0]
-print("number of node features:",data.num_node_features)
-print("number of nodes:", data.num_nodes)
-print("number of features:", data.num_features)
-
-idx = torch.arange(data.num_nodes)
-#creating train_test splits
-train_idx, test_idx = train_test_split(idx, train_size=0.8, stratify=data.y)
-print("Training set:",len(train_idx))
-print("Test set:",len(test_idx))
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-data = data.to(device)
-model = GCN(data.num_node_features, hidden_channels=20, num_layers=3,
-            out_channels=dataset.num_classes).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.005)
-
-
-def train():
+    Returns:
+        float: Training loss.
+    """
     model.train()
     optimizer.zero_grad()
     out = model(data.x, data.edge_index)
@@ -61,7 +40,19 @@ def train():
 
 
 @torch.no_grad()
-def test():
+def evaluate_model(model, data, train_idx, test_idx):
+    """
+    Evaluate the GCN model on training and test data.
+
+    Args:
+        model (GCN): The trained GCN model.
+        data (Data): The input data.
+        train_idx (torch.Tensor): Indices of nodes in the training set.
+        test_idx (torch.Tensor): Indices of nodes in the test set.
+
+    Returns:
+        tuple: A tuple containing train accuracy and test accuracy.
+    """
     model.eval()
     pred = model(data.x, data.edge_index).argmax(dim=-1)
 
@@ -74,19 +65,54 @@ def test():
     return train_acc, test_acc
 
 
-pbar = tqdm(range(1, 2001))
-for epoch in pbar:
-    loss = train()
-    if epoch == 1 or epoch % 200 == 0:
-        train_acc, test_acc = test()
-        pbar.set_description(f'Loss: {loss:.4f}, Train: {train_acc:.4f}, '
-                             f'Test: {test_acc:.4f}')
-pbar.close()
-model.eval()
+def visualize_subgraph(subgraph, node_index, explanation_type, subgraph_nodes):
+    G = to_networkx(subgraph)
+
+    
+    """
+    Visualize a subgraph around a given node.
+
+    Args:
+        subgraph (Data): The subgraph data.
+        node_index (int): The index of the central node.
+        explanation_type (str): The type of explanation ('phenomenon' or 'model').
+    """
+    G = nx.Graph()
+    x = subgraph.num_nodes
+    G.add_nodes_from(range(x))
+    edge_index = subgraph.edge_index.cpu().numpy()
+    G.add_edges_from(edge_index.T)
+
+    plt.figure(figsize=(8, 8))
+    pos = nx.spring_layout(G, seed=42)
+    plt.title(f'Subgraph around node {node_index} (Explanation Type: {explanation_type})')
+
+    # Create a dictionary of node indices to their labels
+    labels = {node: str(subgraph_nodes[node].item()) for node in G.nodes}
+    node_colors = ['yellow' for node in G.nodes]
+
+    distances = {node: abs(node - node_index) for node in G.nodes}
+    closest_nodes = sorted(distances, key=distances.get)[:5]
+
+    node_colors = ['lightgreen' if node in closest_nodes and labels[node] != str(node_index) else 'red' if labels[node] == str(node_index) else 'yellow' for node in G.nodes]
+
+    nx.draw(G, pos, with_labels=True, labels=labels, node_color=node_colors, edge_color='black', linewidths=1, font_color='black', node_size=1000)
+
+    title = f'Subgraph around node {node_index} Explanation Type: {explanation_type}'
+    title = ''.join(c for c in title if c.isalnum() or c.isspace())
+    plt.savefig(title+'.png')
 
 
-subgraph_count = 0
-for explanation_type in ['phenomenon','model']:
+def explain_subgraphs(model, data, explanation_type):
+    """
+    Explain subgraphs using GNNExplainer.
+
+    Args:
+        model (GCN): The trained GCN model.
+        data (Data): The input data.
+        explanation_type (str): The type of explanation ('phenomenon' or 'model').
+    """
+    subgraph_count = 0
     explainer = Explainer(
         model=model,
         algorithm=GNNExplainer(epochs=300),
@@ -100,60 +126,61 @@ for explanation_type in ['phenomenon','model']:
         ),
     )
 
-
-    
-    # Explanation ROC AUC over all test nodes:
     targets, preds = [], []
     node_indices = range(400, data.num_nodes, 5)
     for node_index in tqdm(node_indices, leave=False, desc='Train Explainer'):
         target = data.y if explanation_type == 'phenomenon' else None
-        explanation = explainer(data.x, data.edge_index, index=node_index,
-                                target=target)
-
-        _,_, _, hard_edge_mask = k_hop_subgraph(node_index, num_hops=3,
-                                              edge_index=data.edge_index)
+        explanation = explainer(data.x, data.edge_index, index=node_index, target=target)
+        
+        _, _, _, hard_edge_mask = k_hop_subgraph(node_index, num_hops=3, edge_index=data.edge_index)
         targets.append(data.edge_mask[hard_edge_mask].cpu())
         preds.append(explanation.edge_mask[hard_edge_mask].cpu())
+        if subgraph_count <= 5:
+            subgraph_nodes = torch.unique(data.edge_index[:, hard_edge_mask])
+            subgraph = data.subgraph(subgraph_nodes)
+            visualize_subgraph(subgraph, node_index, explanation_type, subgraph_nodes)
 
-        
-        
-        # VISUALIZATION CODE HERE
-        # Create a NetworkX graph from the subgraph
-        subgraph_nodes = torch.unique(data.edge_index[:, hard_edge_mask])
-        subgraph = data.subgraph(subgraph_nodes)
 
-        
-        subgraph_count += 1
-        if(subgraph_count<=5):
-
-            G = nx.Graph()
-            x = subgraph.num_nodes
-            G.add_nodes_from(range(x))
-            edge_index = subgraph.edge_index.cpu().numpy()
-            G.add_edges_from(edge_index.T)
-            target_class = data.y[node_index].item()
-
-            # Visualize the NetworkX graph
-            plt.figure(figsize=(8, 8))
-            pos = nx.spring_layout(G, seed=42)
-            plt.title(f'Subgraph around node {node_index} (Explanation Type: {explanation_type})\nPredicted Class: {target_class}')
-            # Determine edge colors based on the number of connections
-            edge_colors = ['red' if G.degree[node] <= 3 else 'black' for node in G.nodes]
-            node_colors = ['green' if G.degree[node] > 3 else 'yellow' for node in G.nodes]
-            # Draw the graph with different edge colors
-            nx.draw(G, pos, with_labels=True, node_color=node_colors, node_size=2000, edge_color=edge_colors)
-            nx.draw_networkx_edges(G, pos, width=2.0, edge_color='red')
-            
-            title = f'Subgraph around node {node_index} Explanation Type: {explanation_type} Predicted Class: {target_class}'
-
-            # Remove special characters from the title
-            title = ''.join(c for c in title if c.isalnum() or c.isspace())
-            # Save the graph with the generated title name
-            plt.savefig(f'{title}.png')
-
-            #plt.show()
-            
+            subgraph_count += 1
 
     auc = roc_auc_score(torch.cat(targets), torch.cat(preds))
     print(f'Mean ROC AUC (explanation type {explanation_type:10}): {auc:.4f}')
 
+
+def main():
+    dataset = ExplainerDataset(
+        graph_generator=BAGraph(num_nodes=300, num_edges=5),
+        motif_generator='house',
+        num_motifs=80,
+        transform=T.Constant(),
+    )
+    data = dataset[0]
+    print("Number of node features:", data.num_node_features)
+    print("Number of nodes:", data.num_nodes)
+    print("Number of features:", data.num_features)
+
+    idx = torch.arange(data.num_nodes)
+    train_idx, test_idx = train_test_split(idx, train_size=0.8, stratify=data.y)
+    print("Training set:", len(train_idx))
+    print("Test set:", len(test_idx))
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    data = data.to(device)
+    model = GCN(data.num_node_features, hidden_channels=20, num_layers=3, out_channels=dataset.num_classes).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.005)
+
+    pbar = tqdm(range(1, 2001))
+    for epoch in pbar:
+        loss = train_model(model, data, train_idx, optimizer)
+        if epoch == 1 or epoch % 200 == 0:
+            train_acc, test_acc = evaluate_model(model, data, train_idx, test_idx)
+            pbar.set_description(f'Loss: {loss:.4f}, Train: {train_acc:.4f}, Test: {test_acc:.4f}')
+    pbar.close()
+    model.eval()
+
+    for explanation_type in ['phenomenon', 'model']:
+        explain_subgraphs(model, data, explanation_type)
+
+
+if __name__ == '__main__':
+    main()
