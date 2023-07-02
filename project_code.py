@@ -1,3 +1,6 @@
+#XAI Project
+#Talha Amin, amint, 6944916
+
 import torch
 import torch_geometric
 import torch.nn.functional as F
